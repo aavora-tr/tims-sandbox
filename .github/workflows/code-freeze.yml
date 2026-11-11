@@ -1,0 +1,162 @@
+name: Code freeze
+
+# Toggles the enforcement of a pre-existing branch ruleset on `dev`
+# between "active" (FROZEN) and "disabled" (OPEN), and reports to Teams.
+# It never creates, edits or deletes rules: only the `enforcement` field changes.
+
+on:
+  repository_dispatch:
+    types: [code-freeze, code-unfreeze, freeze-status]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: What to do
+        required: true
+        type: choice
+        options: [freeze, unfreeze, status]
+
+permissions: {}
+
+concurrency:
+  group: code-freeze
+  cancel-in-progress: false
+
+jobs:
+  code-freeze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      RULESET_ID: ${{ vars.FREEZE_RULESET_ID }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Normalise request
+        id: req
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_TYPE: ${{ github.event.action }}
+          INPUT_ACTION: ${{ inputs.action }}
+          PAYLOAD_REQUESTER: ${{ github.event.client_payload.requested_by }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "repository_dispatch" ]]; then
+            case "$DISPATCH_TYPE" in
+              code-freeze)   action=freeze ;;
+              code-unfreeze) action=unfreeze ;;
+              freeze-status) action=status ;;
+              *) echo "::error::Unknown dispatch type"; exit 1 ;;
+            esac
+            requester="$PAYLOAD_REQUESTER"
+          else
+            case "$INPUT_ACTION" in
+              freeze|unfreeze|status) action="$INPUT_ACTION" ;;
+              *) echo "::error::Unknown action input"; exit 1 ;;
+            esac
+            requester="$ACTOR"
+          fi
+
+          # Trim whitespace, then restrict to a safe charset. This also blocks
+          # newlines that could inject extra lines into $GITHUB_OUTPUT.
+          requester="$(printf '%s' "$requester" | tr -d '[:space:]')"
+          if [[ ! "$requester" =~ ^[A-Za-z0-9._%+@-]{1,254}$ ]]; then
+            echo "::error::Missing or invalid requested_by"
+            echo "requester=(invalid)" >> "$GITHUB_OUTPUT"
+            echo "action=$action" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          echo "requester=$requester" >> "$GITHUB_OUTPUT"
+          echo "Action: $action, requested by: $requester"
+
+      - name: Check allowlist
+        id: allow
+        env:
+          REQUESTER: ${{ steps.req.outputs.requester }}
+          ALLOWLIST: ${{ vars.FREEZE_ALLOWLIST }}
+        run: |
+          set -euo pipefail
+          want="$(printf '%s' "$REQUESTER" | tr '[:upper:]' '[:lower:]')"
+          IFS=',' read -r -a entries <<< "$ALLOWLIST"
+          for entry in "${entries[@]}"; do
+            entry="$(printf '%s' "$entry" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+            if [[ -n "$entry" && "$entry" == "$want" ]]; then
+              echo "allowed=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "allowed=false" >> "$GITHUB_OUTPUT"
+          echo "::error::Requester is not on FREEZE_ALLOWLIST"
+          exit 1
+
+      - name: Apply and verify ruleset enforcement
+        id: ruleset
+        env:
+          GH_TOKEN: ${{ secrets.FREEZE_ADMIN_TOKEN }}
+          ACTION: ${{ steps.req.outputs.action }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RULESET_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::FREEZE_RULESET_ID is missing or not numeric"
+            exit 1
+          fi
+
+          case "$ACTION" in
+            freeze)   want=active ;;
+            unfreeze) want=disabled ;;
+            status)   want="" ;;
+          esac
+
+          if [[ -n "$want" ]]; then
+            gh api --method PUT "repos/$REPO/rulesets/$RULESET_ID" \
+              -f enforcement="$want" --silent
+          fi
+
+          current="$(gh api "repos/$REPO/rulesets/$RULESET_ID" --jq '.enforcement')"
+          echo "enforcement=$current" >> "$GITHUB_OUTPUT"
+          if [[ "$current" == "active" ]]; then
+            echo "state=FROZEN" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=OPEN" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Ruleset $RULESET_ID enforcement: $current"
+
+          if [[ -n "$want" && "$current" != "$want" ]]; then
+            echo "::error::Expected enforcement '$want' but got '$current'"
+            exit 1
+          fi
+
+      - name: Notify Teams
+        if: success()
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          ACTION: ${{ steps.req.outputs.action }}
+          REQUESTER: ${{ steps.req.outputs.requester }}
+          STATE: ${{ steps.ruleset.outputs.state }}
+          ENFORCEMENT: ${{ steps.ruleset.outputs.enforcement }}
+        run: |
+          set -euo pipefail
+          text="Code freeze: '$ACTION' by $REQUESTER on $REPO. dev is now $STATE (ruleset enforcement: $ENFORCEMENT). Run: $RUN_URL"
+          jq -n --arg text "$text" '{text: $text}' \
+            | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- "$TEAMS_WEBHOOK_URL"
+          echo "### $text" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Teams of failure
+        if: failure()
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          ACTION: ${{ steps.req.outputs.action }}
+          REQUESTER: ${{ steps.req.outputs.requester }}
+          ALLOWED: ${{ steps.allow.outputs.allowed }}
+          STATE: ${{ steps.ruleset.outputs.state }}
+        run: |
+          set -euo pipefail
+          if [[ "$ALLOWED" == "false" ]]; then
+            text="Code freeze: ${REQUESTER:-unknown} is not allowed to run '${ACTION:-unknown}' on $REPO. No change made. Run: $RUN_URL"
+          else
+            text="Code freeze: '${ACTION:-unknown}' requested by ${REQUESTER:-unknown} on $REPO FAILED. Current state: ${STATE:-unknown}. Check the run: $RUN_URL"
+          fi
+          jq -n --arg text "$text" '{text: $text}' \
+            | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- "$TEAMS_WEBHOOK_URL"
+          echo "### $text" >> "$GITHUB_STEP_SUMMARY"
